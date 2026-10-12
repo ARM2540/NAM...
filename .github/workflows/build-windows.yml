@@ -1,0 +1,127 @@
+name: Build NAM Audio Processor (Windows)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nam-vst3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build VST3 (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify required project files
+        shell: pwsh
+        run: |
+          $required = @(
+            "CMakeLists.txt",
+            "Source/PluginProcessor.cpp",
+            "Source/PluginProcessor.h",
+            "Source/PluginEditor.cpp",
+            "Source/PluginEditor.h"
+          )
+
+          $missing = @($required | Where-Object { -not (Test-Path $_) })
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing required project files:"
+            $missing | ForEach-Object { Write-Host " - $_" }
+            exit 1
+          }
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          cmake --version
+          git --version
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 2>&1 |
+            Tee-Object -FilePath configure.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Error "CMake configure failed with exit code $code"
+            exit $code
+          }
+
+      - name: Build VST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          cmake --build build --config Release --parallel 2 --verbose 2>&1 |
+            Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+
+          Write-Host "`n===== Compiler errors and warnings (if any) ====="
+          if (Test-Path "build.log") {
+            Select-String -Path "build.log" -Pattern 'error C[0-9]+|fatal error|error:|warning C[0-9]+' |
+              ForEach-Object { Write-Host $_.Line }
+          }
+
+          if ($code -ne 0) {
+            Write-Error "Build failed with exit code $code. Download the diagnostics artifact."
+            exit $code
+          }
+
+      - name: Find and package VST3
+        if: success()
+        shell: pwsh
+        run: |
+          $plugin = Get-ChildItem -Path "build" -Recurse -Directory -Filter "*.vst3" |
+            Where-Object { $_.FullName -notmatch '[\\/]\_deps[\\/]' } |
+            Select-Object -First 1
+
+          if (-not $plugin) {
+            Write-Host "No .vst3 bundle found. Build output paths:"
+            Get-ChildItem -Path "build" -Recurse -Force |
+              Select-Object -ExpandProperty FullName
+            throw "Build succeeded but no .vst3 bundle was found. Check CMake target configuration."
+          }
+
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          $zipPath = Join-Path (Resolve-Path "dist").Path "NAM-Audio-Processor-Windows-VST3.zip"
+          Compress-Archive -Path $plugin.FullName -DestinationPath $zipPath -Force
+          Write-Host "Created artifact: $zipPath"
+
+      - name: Upload VST3 artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NAM-Audio-Processor-Windows-VST3
+          path: dist/NAM-Audio-Processor-Windows-VST3.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NAM-Audio-Processor-Windows-Diagnostics
+          path: |
+            configure.log
+            build.log
+            build/CMakeCache.txt
+          if-no-files-found: ignore
+          retention-days: 14
